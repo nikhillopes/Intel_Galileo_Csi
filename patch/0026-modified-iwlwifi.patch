@@ -1,0 +1,1750 @@
+From ab1c1a8610f960a8d4836e0193a9eaafa74ec8ec Mon Sep 17 00:00:00 2001
+From: nikhillopes <nikhillopes@gmail.com>
+Date: Fri, 26 Jun 2015 19:35:38 -0400
+Subject: [PATCH] modified iwlwifi
+
+---
+ drivers/net/wireless/iwlwifi/Kconfig         |   2 +-
+ drivers/net/wireless/iwlwifi/dvm/Makefile    |   2 +-
+ drivers/net/wireless/iwlwifi/dvm/agn.h       |  11 +
+ drivers/net/wireless/iwlwifi/dvm/commands.h  |  72 +++++-
+ drivers/net/wireless/iwlwifi/dvm/connector.c | 207 +++++++++++++++++
+ drivers/net/wireless/iwlwifi/dvm/connector.h |  88 ++++++++
+ drivers/net/wireless/iwlwifi/dvm/debugfs.c   | 317 +++++++++++++++++++++++++++
+ drivers/net/wireless/iwlwifi/dvm/dev.h       |  18 +-
+ drivers/net/wireless/iwlwifi/dvm/lib.c       |  85 ++++++-
+ drivers/net/wireless/iwlwifi/dvm/main.c      |  32 ++-
+ drivers/net/wireless/iwlwifi/dvm/rs.c        |  11 +
+ drivers/net/wireless/iwlwifi/dvm/rx.c        |  27 ++-
+ drivers/net/wireless/iwlwifi/dvm/rxon.c      |  38 ++++
+ drivers/net/wireless/iwlwifi/dvm/sta.c       |  45 ++++
+ drivers/net/wireless/iwlwifi/dvm/tx.c        |  36 ++-
+ drivers/net/wireless/iwlwifi/dvm/ucode.c     |   4 +-
+ drivers/net/wireless/iwlwifi/iwl-devtrace.h  |  10 +-
+ drivers/net/wireless/iwlwifi/iwl-drv.c       |  17 ++
+ drivers/net/wireless/iwlwifi/iwl-modparams.h |   4 +-
+ drivers/net/wireless/iwlwifi/iwl-trans.h     |   2 +-
+ drivers/net/wireless/iwlwifi/pcie/5000.c     |   2 +-
+ drivers/net/wireless/iwlwifi/pcie/internal.h |   9 -
+ drivers/net/wireless/iwlwifi/pcie/tx.c       |  73 ++----
+ 23 files changed, 1013 insertions(+), 99 deletions(-)
+ create mode 100644 drivers/net/wireless/iwlwifi/dvm/connector.c
+ create mode 100644 drivers/net/wireless/iwlwifi/dvm/connector.h
+
+diff --git a/drivers/net/wireless/iwlwifi/Kconfig b/drivers/net/wireless/iwlwifi/Kconfig
+index 5cf4323..2c52dd0 100644
+--- a/drivers/net/wireless/iwlwifi/Kconfig
++++ b/drivers/net/wireless/iwlwifi/Kconfig
+@@ -44,7 +44,7 @@ config IWLWIFI
+ 
+ config IWLDVM
+ 	tristate "Intel Wireless WiFi"
+-	depends on IWLWIFI
++	depends on IWLWIFI && CONNECTOR
+ 
+ menu "Debugging Options"
+ 	depends on IWLWIFI
+diff --git a/drivers/net/wireless/iwlwifi/dvm/Makefile b/drivers/net/wireless/iwlwifi/dvm/Makefile
+index 5ff76b2..cc5f433 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/Makefile
++++ b/drivers/net/wireless/iwlwifi/dvm/Makefile
+@@ -4,7 +4,7 @@ iwldvm-objs		+= main.o rs.o mac80211.o ucode.o tx.o
+ iwldvm-objs		+= lib.o calib.o tt.o sta.o rx.o
+ 
+ iwldvm-objs		+= power.o
+-iwldvm-objs		+= scan.o led.o
++iwldvm-objs		+= scan.o led.o connector.o
+ iwldvm-objs		+= rxon.o devices.o
+ 
+ iwldvm-$(CONFIG_IWLWIFI_DEBUGFS) += debugfs.o
+diff --git a/drivers/net/wireless/iwlwifi/dvm/agn.h b/drivers/net/wireless/iwlwifi/dvm/agn.h
+index 33b3ad2..0de71d6 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/agn.h
++++ b/drivers/net/wireless/iwlwifi/dvm/agn.h
+@@ -215,6 +215,8 @@ int iwlagn_rx_reply_compressed_ba(struct iwl_priv *priv,
+ 				   struct iwl_device_cmd *cmd);
+ int iwlagn_rx_reply_tx(struct iwl_priv *priv, struct iwl_rx_cmd_buffer *rxb,
+ 			       struct iwl_device_cmd *cmd);
++int iwlagn_bfee_notif(struct iwl_priv *priv, struct iwl_rx_cmd_buffer *rxb,
++		      struct iwl_device_cmd *cmd);
+ 
+ static inline u32 iwl_tx_status_to_mac80211(u32 status)
+ {
+@@ -525,4 +527,13 @@ static inline const char *iwl_dvm_get_cmd_string(u8 cmd)
+ 		return s;
+ 	return "UNKNOWN";
+ }
++
++extern const u8 iwl_monitor_addr[ETH_ALEN];
++static inline bool is_monitor_ether_addr(const u8 *addr)
++{
++	if (WARN_ON(addr == NULL))
++		return 0;
++	return !memcmp(addr, iwl_monitor_addr, ETH_ALEN);
++}
++
+ #endif /* __iwl_agn_h__ */
+diff --git a/drivers/net/wireless/iwlwifi/dvm/commands.h b/drivers/net/wireless/iwlwifi/dvm/commands.h
+index 71ab76b..42e66a8 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/commands.h
++++ b/drivers/net/wireless/iwlwifi/dvm/commands.h
+@@ -158,6 +158,10 @@ enum {
+ 	REPLY_CT_KILL_CONFIG_CMD = 0xa4,
+ 	SENSITIVITY_CMD = 0xa8,
+ 	REPLY_PHY_CALIBRATION_CMD = 0xb0,
++
++	/* Beamforming */
++	REPLY_BFEE_NOTIFICATION = 0xbb,
++
+ 	REPLY_RX_PHY_CMD = 0xc0,
+ 	REPLY_RX_MPDU_CMD = 0xc1,
+ 	REPLY_RX = 0xc3,
+@@ -187,6 +191,9 @@ enum {
+ 	REPLY_WOWLAN_GET_STATUS = 0xe5,
+ 	REPLY_D3_CONFIG = 0xd3,
+ 
++	/* Gets metadata for Beamforming */
++	DSP_DEBUG_CMD = 0xf1,
++
+ 	REPLY_MAX = 0xff
+ };
+ 
+@@ -578,6 +585,10 @@ enum {
+ #define RXON_FLG_CHANNEL_MODE_PURE_40	cpu_to_le32(CHANNEL_MODE_PURE_40 << RXON_FLG_CHANNEL_MODE_POS)
+ #define RXON_FLG_CHANNEL_MODE_MIXED	cpu_to_le32(CHANNEL_MODE_MIXED << RXON_FLG_CHANNEL_MODE_POS)
+ 
++/* Beamforming */
++#define RXON_FLG_BF_ENABLE_POS			(29)
++#define RXON_FLG_BF_ENABLE_MSK			cpu_to_le32(0x1<<29)
++
+ /* CTS to self (if spec allows) flag */
+ #define RXON_FLG_SELF_CTS_EN			cpu_to_le32(0x1<<30)
+ 
+@@ -789,6 +800,7 @@ struct iwl_qosparam_cmd {
+ #define	IWL_AP_ID		0
+ #define	IWL_AP_ID_PAN		1
+ #define	IWL_STA_ID		2
++#define IWLAGN_MONITOR_ID	13
+ #define IWLAGN_PAN_BCAST_ID	14
+ #define IWLAGN_BROADCAST_ID	15
+ #define	IWLAGN_STATION_COUNT	16
+@@ -1095,6 +1107,7 @@ struct iwl_wep_cmd {
+ #define IWLAGN_OFDM_RSSI_INBAND_C_BITMSK 0x00ff
+ #define IWLAGN_OFDM_RSSI_ALLBAND_C_BITMSK 0xff00
+ #define IWLAGN_OFDM_RSSI_C_BIT_POS 0
++#define IWLAGN_MAX_CFG_PHY_CNT 20
+ 
+ struct iwlagn_non_cfg_phy {
+ 	__le32 non_cfg_phy[IWLAGN_RX_RES_PHY_CNT];  /* up to 8 phy entries */
+@@ -1107,7 +1120,7 @@ struct iwlagn_non_cfg_phy {
+  */
+ struct iwl_rx_phy_res {
+ 	u8 non_cfg_phy_cnt;     /* non configurable DSP phy data byte count */
+-	u8 cfg_phy_cnt;		/* configurable DSP phy data byte count */
++	u8 cfg_phy_cnt;		/* configurable DSP phy data element count */
+ 	u8 stat_id;		/* configurable DSP phy data set ID */
+ 	u8 reserved1;
+ 	__le64 timestamp;	/* TSF at on air rise */
+@@ -1118,6 +1131,7 @@ struct iwl_rx_phy_res {
+ 	__le32 rate_n_flags;	/* RATE_MCS_* */
+ 	__le16 byte_count;	/* frame's byte-count */
+ 	__le16 frame_time;	/* frame's time on the air */
++	u8 cfg_phy_buf[0];	/* The values requested via DSP_DEBUG */
+ } __packed;
+ 
+ struct iwl_rx_mpdu_res_start {
+@@ -3897,6 +3911,62 @@ struct iwlagn_wowlan_kek_kck_material_cmd {
+ 	__le64	replay_ctr;
+ } __packed;
+ 
++/******************************************************************************
++ * (14)
++ * Beamforming commands
++ *
++ *****************************************************************************/
++
++/*
++ * REPLY_BFEE_NOTIFICATION = 0xbb
++ *
++ */
++struct iwl_bfee_notif {
++	__le32 timestamp_low;
++	__le16 bfee_count;
++	__le16 reserved1;
++	u8 Nrx, Ntx;
++	u8 rssiA, rssiB, rssiC;
++	s8 noise;
++	u8 agc, antenna_sel;
++	__le16 len;
++	__le16 fake_rate_n_flags;
++	u8 payload[0];
++} __attribute__ ((packed));
++
++/******************************************************************************
++ * (15)
++ * DSP debug interface
++ *
++ *****************************************************************************/
++
++/* DSP debugging */
++#define DSP_DEBUG_CCK_MSK		(0x1)
++#define DSP_DEBUG_OFDM_MSK		(0x0)
++/* MIB values */
++#define OFDM_RX_ANT_OUT			0x4302
++
++/*
++ * DSP_DEBUG_CMD = 0xf1
++ *
++ */
++struct iwl5000_dsp_debug {
++	u8 mib_cnt;
++	u8 flags;
++	u8 stat_id;
++	u8 reserved;
++	u16 mib_indices[0];
++} __attribute__ ((packed));
++
++/* For rotate rates */
++#define ROTATE_SISO	1
++#define ROTATE_MIMO2	2
++#define ROTATE_MIMO3	4
++#define ROTATE_TX_SEL	8
++#define ROTATE_HT40	16
++#define ROTATE_SGI	32
++#define ROTATE_SKIP	64
++
+ /*
+  * REPLY_WIPAN_PARAMS = 0xb2 (Commands and Notification)
+  */
+diff --git a/drivers/net/wireless/iwlwifi/dvm/connector.c b/drivers/net/wireless/iwlwifi/dvm/connector.c
+new file mode 100644
+index 0000000..1ae703d
+--- /dev/null
++++ b/drivers/net/wireless/iwlwifi/dvm/connector.c
+@@ -0,0 +1,207 @@
++/******************************************************************************
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * Copyright(c) 2008-2011 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110,
++ * USA
++ *
++ * The full GNU General Public License is included in this distribution
++ * in the file called LICENSE.GPL.
++ *
++ * Contact Information:
++ * Daniel Halperin <dhalperi@cs.washington.edu>
++ * University of Washington CSE, 185 Stevens Way AC101, Seattle, WA 98195-2350
++ * Anmol Sheth <anmol.n.sheth@intel.com>
++ * Intel Labs Seattle, 1100 NE 45th St, Seattle, WA 98105
++ *
++ *****************************************************************************/
++
++#include "connector.h"
++#include <linux/export.h>
++
++/**
++ * This struct is required for the connector interface to be set up.
++ */
++struct cb_id connector_id = {
++	.idx = CN_IDX_IWLAGN,
++	.val = CN_VAL_IWLAGN,
++};
++EXPORT_SYMBOL(connector_id);
++char *connector_name = "iwlagn";
++EXPORT_SYMBOL(connector_name);
++static struct work_struct connector_work_s;
++
++static struct iwl_priv *priv;
++static spinlock_t connector_lock;
++
++#define CN_BUF_SIZE	1024
++static struct cn_msg *cn_msg_buf[CN_BUF_SIZE];
++static u32 cn_buf_read, cn_buf_write;
++
++/**
++ * Enqueues a connector message into the buffer. Will drop and free if full.
++ */
++static void connector_enqueue_msg(struct cn_msg *m)
++{
++	unsigned long flags;
++	u32 start, end;
++
++	/* Get read and write indices */
++	spin_lock_irqsave(&connector_lock, flags);
++	start = cn_buf_read;
++	end = cn_buf_write;
++	spin_unlock_irqrestore(&connector_lock, flags);
++
++	/* Make sure space for message */
++	if ((end + 1) % CN_BUF_SIZE == start) {
++		printk(KERN_ERR "%s: buffer full; connector message dropped\n",
++				__func__);
++		kfree(m);
++		return;
++	}
++
++	/* Make sure priv is known */
++	if (priv == NULL) {
++		printk(KERN_ERR "%s: priv is NULL\n", __func__);
++		kfree(m);
++		return;
++	}
++
++	/* Enqueue message */
++	cn_msg_buf[end] = m;
++	spin_lock_irqsave(&connector_lock, flags);
++	cn_buf_write = (end + 1) % CN_BUF_SIZE;
++	spin_unlock_irqrestore(&connector_lock, flags);
++
++	/* Schedule tasklet */
++	queue_work(priv->workqueue, &connector_work_s);
++}
++
++/**
++ * Sends and frees all the queued messages.
++ */
++static void connector_send_all(void)
++{
++	u32 i;
++	unsigned long flags;
++	u32 start, end;
++
++	/* Get current index */
++	spin_lock_irqsave(&connector_lock, flags);
++	start = cn_buf_read;
++	end = cn_buf_write;
++	spin_unlock_irqrestore(&connector_lock, flags);
++
++	/* Loop through buffer sending messages */
++	for (i = start; i != end; i = ((i+1) % CN_BUF_SIZE)) {
++		cn_netlink_send(cn_msg_buf[i], 0, GFP_ATOMIC);
++		kfree(cn_msg_buf[i]);
++	}
++
++	/* Set index back to zero, if it has reached 1024 */
++	spin_lock_irqsave(&connector_lock, flags);
++	cn_buf_read = end;
++	spin_unlock_irqrestore(&connector_lock, flags);
++}
++static void connector_work(struct work_struct *trash)
++{
++	connector_send_all();
++}
++
++/**
++ * Sends the message over the kernel connector to a userspace program.
++ */
++void connector_send_msg(const u8 *data, const u32 size, const u8 code)
++{
++	struct cn_msg *m;
++	u8 *buf;
++	u32 payload_size;
++
++	/* Payload + 1-byte "code" */
++	payload_size = size + 1 + sizeof(struct cn_msg);
++	m = kmalloc(payload_size, GFP_ATOMIC);
++	if (m == NULL) {
++		printk(KERN_ERR "%s: malloc failed\n", __func__);
++		return;
++	}
++	buf = ((u8 *) m) + sizeof(struct cn_msg);
++
++	/* Set up message */
++	memcpy(&m->id, &connector_id, sizeof(struct cb_id));
++	m->seq = 0;
++	m->len = size + 1;
++	buf[0] = code;
++	memcpy(&buf[1], data, size);
++
++	/* Enqueue message -- may free on failure */
++	connector_enqueue_msg(m);
++
++	return;
++}
++EXPORT_SYMBOL(connector_send_msg);
++
++void connector_callback(struct cn_msg *msg, struct netlink_skb_parms *nsp)
++{
++	printk(KERN_ERR "%s: %lu: unhandled message idx=%x, val=%x, seq=%u, ack=%u, len=%d.\n",
++		__func__, jiffies, msg->id.idx, msg->id.val,
++	msg->seq, msg->ack, msg->len);
++}
++EXPORT_SYMBOL(connector_callback);
++int iwlagn_register_connector(void)
++{
++	int ret;
++
++	/* Try and setup the connector callback */
++	ret = cn_add_callback(&connector_id, connector_name,
++			connector_callback);
++	if (ret)
++		return ret;
++
++	/* Init connector message queue, lock, and tasklet */
++	cn_buf_read = 0;
++	cn_buf_write = 0;
++	spin_lock_init(&connector_lock);
++	INIT_WORK(&connector_work_s, connector_work);
++
++	printk(KERN_INFO "iwlagn: connector callback registered\n");
++	return 0;
++}
++EXPORT_SYMBOL(iwlagn_register_connector);
++void iwlagn_unregister_connector(void)
++{
++	u32 i;
++	unsigned long flags;
++
++	/* Reset the connector state */
++	spin_lock_irqsave(&connector_lock, flags);
++	for (i = cn_buf_read; i != cn_buf_write; i = (i+1) % CN_BUF_SIZE)
++		kfree(cn_msg_buf[i]);
++	spin_unlock_irqrestore(&connector_lock, flags);
++
++	/* Deregister connector */
++	cn_del_callback(&connector_id);
++	printk(KERN_INFO "iwlagn: connector callback deregistered\n");
++}
++EXPORT_SYMBOL(iwlagn_unregister_connector);
++void iwl_connector_set_priv(struct iwl_priv *p)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&connector_lock, flags);
++	priv = p;
++	spin_unlock_irqrestore(&connector_lock, flags);
++}
++EXPORT_SYMBOL(iwl_connector_set_priv);
+diff --git a/drivers/net/wireless/iwlwifi/dvm/connector.h b/drivers/net/wireless/iwlwifi/dvm/connector.h
+new file mode 100644
+index 0000000..703551b
+--- /dev/null
++++ b/drivers/net/wireless/iwlwifi/dvm/connector.h
+@@ -0,0 +1,88 @@
++/******************************************************************************
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * Copyright(c) 2008-2011 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110,
++ * USA
++ *
++ * The full GNU General Public License is included in this distribution
++ * in the file called LICENSE.GPL.
++ *
++ * Contact Information:
++ * Daniel Halperin <dhalperi@cs.washington.edu>
++ * University of Washington CSE, 185 Stevens Way AC101, Seattle, WA 98195-2350
++ * Anmol Sheth <anmol.n.sheth@intel.com>
++ * Intel Labs Seattle, 1100 NE 45th St, Seattle, WA 98105
++ *
++ *****************************************************************************/
++
++/**
++ * This file defines the connector interface.
++ */
++
++#ifndef __iwl_connector_h__
++#define __iwl_connector_h__
++
++#include <linux/etherdevice.h>
++#include <net/mac80211.h>
++#include <asm/unaligned.h>
++#include <linux/connector.h>
++#include "dev.h"
++#include "commands.h"
++
++extern struct cb_id connector_id;
++extern char *connector_name;
++
++void connector_send_msg(const u8 *data, const u32 size, const u8 code);
++void iwl_connector_set_priv(struct iwl_priv *p);
++void connector_tasklet(unsigned long trash);
++
++#define CN_IDX_IWLAGN	(CN_NETLINK_USERS + 0xf)
++#define CN_VAL_IWLAGN	0x1
++
++#define IWL_CONN_BFEE_NOTIF	REPLY_BFEE_NOTIFICATION		/* 0xbb */
++#define IWL_CONN_RX_PHY		REPLY_RX_PHY_CMD		/* 0xc0 */
++#define IWL_CONN_RX_MPDU	REPLY_RX_MPDU_CMD		/* 0xc1 */
++#define IWL_CONN_RX		REPLY_RX			/* 0xc3 */
++#define IWL_CONN_NOISE		0xd0		/* new ID not a command */
++#define IWL_CONN_TX_RESP	REPLY_TX			/* 0x1c */
++#define IWL_CONN_TX_BLOCK_AGG	REPLY_COMPRESSED_BA		/* 0xc5 */
++#define IWL_CONN_STATUS		0xd1		/* new ID not a command */
++
++enum {
++	IWL_CONN_BFEE_NOTIF_MSK		= (1 << 0),
++	IWL_CONN_RX_PHY_MSK		= (1 << 1),
++	IWL_CONN_RX_MPDU_MSK		= (1 << 2),
++	IWL_CONN_RX_MSK			= (1 << 3),
++	IWL_CONN_NOISE_MSK		= (1 << 4),
++	IWL_CONN_TX_RESP_MSK		= (1 << 5),
++	IWL_CONN_TX_BLOCK_AGG_MSK	= (1 << 6),
++	IWL_CONN_STATUS_MSK		= (1 << 7),
++};
++
++void connector_callback(struct cn_msg *msg, struct netlink_skb_parms *nsp);
++int iwlagn_register_connector(void);
++void iwlagn_unregister_connector(void);
++
++/*
++ * Struct to send TX block aggregation information down to the host.
++ */
++struct tx_agg_ba_connector_msg {
++	u32 successes;
++	u32 frame_count;
++};
++
++#endif /* __iwl_connector_h__ */
+diff --git a/drivers/net/wireless/iwlwifi/dvm/debugfs.c b/drivers/net/wireless/iwlwifi/dvm/debugfs.c
+index 5b9533e..5e4fd14 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/debugfs.c
++++ b/drivers/net/wireless/iwlwifi/dvm/debugfs.c
+@@ -2348,6 +2348,318 @@ DEBUGFS_READ_WRITE_FILE_OPS(log_event);
+ #endif
+ DEBUGFS_READ_WRITE_FILE_OPS(calib_disabled);
+ 
++static ssize_t iwl_dbgfs_bf_flag_read(struct file *file,
++					  char __user *user_buf,
++					  size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[11];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf), "%d", priv->bf_enabled);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t iwl_dbgfs_bf_flag_write(struct file *file,
++					   const char __user *user_buf,
++					   size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[11];
++	unsigned long val;
++	int ret;
++
++	if (count > sizeof(buf))
++		return -EINVAL;
++
++	memset(buf, 0, sizeof(buf));
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	ret = strict_strtoul(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	priv->bf_enabled = !!val;
++
++	return count;
++}
++DEBUGFS_READ_WRITE_FILE_OPS(bf_flag);
++
++static ssize_t iwl_dbgfs_rx_chains_msk_read(struct file *file,
++					  char __user *user_buf,
++					  size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[128];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf), "rx_chains: %d antennas, mask 0x%x",
++			priv->hw_params.rx_chains_num,
++			priv->nvm_data->valid_rx_ant);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t iwl_dbgfs_rx_chains_msk_write(struct file *file,
++					   const char __user *user_buf,
++					   size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	struct iwl_rxon_context *ctx;
++	char buf[11];
++	unsigned long val;
++	int ret;
++
++	if (count > sizeof(buf))
++		return -EINVAL;
++
++	memset(buf, 0, sizeof(buf));
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	ret = strict_strtoul(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	if ((val & ANT_ABC) != val) {
++		IWL_ERR(priv, "Invalid rx ant mask 0x%lx\n", val);
++		return -EINVAL;
++	}
++	IWL_INFO(priv, "Committing rx_chains_msk = 0x%lx\n", val);
++
++	mutex_lock(&priv->mutex);
++	/* Update chains and number of chains */
++	priv->nvm_data->valid_rx_ant = val;
++	priv->hw_params.rx_chains_num = num_of_ant(val);
++	/* This is useful for verifying valid rates */
++	priv->chain_noise_data.active_chains = val;
++
++	for_each_context(priv, ctx) {
++		iwlagn_set_rxon_chain(priv, ctx);
++		iwlagn_commit_rxon(priv, ctx);
++	}
++	mutex_unlock(&priv->mutex);
++
++	return count;
++}
++DEBUGFS_READ_WRITE_FILE_OPS(rx_chains_msk);
++
++static ssize_t iwl_dbgfs_rotate_rates_read(struct file *file,
++					  char __user *user_buf,
++					  size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[11];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf), "0x%x", priv->rotate_rates);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t iwl_dbgfs_rotate_rates_write(struct file *file,
++					   const char __user *user_buf,
++					   size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[11];
++	unsigned long val;
++	int ret;
++	u32 num_rates;
++	u32 cur_rate;
++	u32 tmp, i, start_rate;
++
++	if (count > sizeof(buf))
++		return -EINVAL;
++
++	memset(buf, 0, sizeof(buf));
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	ret = strict_strtoul(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	/* Dan: new rotate_rates scheme using flags */
++	if (priv->rotate_rates) {
++		kfree(priv->rotate_rate_array);
++		priv->rotate_rate_array = NULL;
++		priv->last_rotate_rate = 0;
++		priv->rotate_rate_total = 0;
++		priv->rotate_rates = 0;
++	}
++
++	if (val == 0)
++		return count;
++
++	/* Parse val to determine number of configs */
++	num_rates = 0;
++	if (val & ROTATE_SISO) /* SISO */
++		num_rates++;
++	if (val & ROTATE_MIMO2) /* MIMO2 */
++		num_rates++;
++	if (val & ROTATE_MIMO3) /* MIMO3 */
++		num_rates++;
++	if (val & ROTATE_TX_SEL) /* TX SEL */ {
++		if (val & ROTATE_SISO) num_rates += 2;
++		if (val & ROTATE_MIMO2) num_rates += 2;
++	}
++	if (val & ROTATE_HT40) /* HT40 */
++		num_rates *= 2;
++	if (val & ROTATE_SGI) /* SGI */
++		num_rates *= 2;
++	if (val & ROTATE_SKIP) /* SKIP short rates */ {
++		num_rates *= 6;
++		start_rate = 2;
++	} else {
++		num_rates *= 8;
++		start_rate = 0;
++	}
++
++	/* Shouldn't be true but may as well make sure */
++	if (num_rates == 0)
++		return -EINVAL;
++
++	/* Now set up rotate_rate_array */
++	priv->rotate_rate_array = kmalloc(num_rates * sizeof(u32),
++			GFP_KERNEL);
++	if (!priv->rotate_rate_array)
++		return -ENOMEM;
++	priv->rotate_rates = 1;
++	priv->last_rotate_rate = 0;
++	priv->rotate_rate_total = num_rates;
++
++	cur_rate = 0;
++	if (val & ROTATE_SISO) /* SISO rates */
++		for (i = start_rate; i < 8; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] = 0x4100 + i;
++	if (val & ROTATE_MIMO2) /* MIMO2 rates */
++		for (i = start_rate; i < 8; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] = 0xc108 + i;
++	if (val & ROTATE_MIMO3) /* MIMO3 rates */
++		for (i = start_rate; i < 8; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] = 0x1c110 + i;
++	if ((val & ROTATE_TX_SEL) && (val & ROTATE_SISO)) {
++		/* TX SEL SISO rates */
++		for (i = start_rate; i < 8; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] = 0x8100 + i;
++		for (i = start_rate; i < 8; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] = 0x10100 + i;
++	}
++	if ((val & ROTATE_TX_SEL) && (val & ROTATE_MIMO2)) {
++		/* TX SEL MIMO2 rates */
++		for (i = start_rate; i < 8; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] = 0x14108 + i;
++		for (i = start_rate; i < 8; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] = 0x18108 + i;
++	}
++	if (val & ROTATE_HT40) { /* HT40 rates */
++		tmp = cur_rate;
++		for (i = start_rate; i < tmp; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] =
++				priv->rotate_rate_array[i] | RATE_MCS_HT40_MSK;
++	}
++	if (val & ROTATE_SGI) { /* SGI rates */
++		tmp = cur_rate;
++		for (i = start_rate; i < tmp; ++i, ++cur_rate)
++			priv->rotate_rate_array[cur_rate] =
++				priv->rotate_rate_array[i] | RATE_MCS_SGI_MSK;
++	}
++
++	IWL_INFO(priv, "Set up %u rotate_rates:%s%s%s%s%s%s%s.\n",
++			priv->rotate_rate_total,
++			(val & ROTATE_SISO) ? " SISO" : "",
++			(val & ROTATE_MIMO2) ? " MIMO2" : "",
++			(val & ROTATE_MIMO3) ? " MIMO3" : "",
++			(val & ROTATE_TX_SEL) ? " TX_SEL" : "",
++			(val & ROTATE_HT40) ? " HT40" : "",
++			(val & ROTATE_SGI) ? " SGI" : "",
++			(val & ROTATE_SKIP) ? " SKIP" : "");
++
++	return count;
++}
++DEBUGFS_READ_WRITE_FILE_OPS(rotate_rates);
++
++static ssize_t iwl_dbgfs_monitor_tx_rate_read(struct file *file,
++					  char __user *user_buf,
++					  size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[11];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf), "0x%x", priv->monitor_tx_rate);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t iwl_dbgfs_monitor_tx_rate_write(struct file *file,
++					   const char __user *user_buf,
++					   size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[11];
++	unsigned long val;
++	int ret;
++
++	if (count > sizeof(buf))
++		return -EINVAL;
++
++	memset(buf, 0, sizeof(buf));
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	ret = strict_strtoul(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	priv->monitor_tx_rate = val;
++
++	return count;
++}
++DEBUGFS_READ_WRITE_FILE_OPS(monitor_tx_rate);
++
++static ssize_t iwl_dbgfs_bcast_tx_rate_read(struct file *file,
++					  char __user *user_buf,
++					  size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[11];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf), "0x%x", priv->bcast_tx_rate);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static ssize_t iwl_dbgfs_bcast_tx_rate_write(struct file *file,
++					   const char __user *user_buf,
++					   size_t count, loff_t *ppos)
++{
++	struct iwl_priv *priv = file->private_data;
++	char buf[11];
++	unsigned long val;
++	int ret;
++
++	if (count > sizeof(buf))
++		return -EINVAL;
++
++	memset(buf, 0, sizeof(buf));
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	ret = strict_strtoul(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	priv->bcast_tx_rate = val;
++
++	return count;
++}
++DEBUGFS_READ_WRITE_FILE_OPS(bcast_tx_rate);
++
+ /*
+  * Create the debugfs files and directories
+  *
+@@ -2406,6 +2718,11 @@ int iwl_dbgfs_register(struct iwl_priv *priv, struct dentry *dbgfs_dir)
+ 
+ 	if (iwl_advanced_bt_coexist(priv))
+ 		DEBUGFS_ADD_FILE(bt_traffic, dir_debug, S_IRUSR);
++	DEBUGFS_ADD_FILE(bf_flag, dir_debug, S_IRUSR | S_IWUSR);
++	DEBUGFS_ADD_FILE(rx_chains_msk, dir_debug, S_IRUSR | S_IWUSR);
++	DEBUGFS_ADD_FILE(rotate_rates, dir_debug, S_IRUSR | S_IWUSR);
++	DEBUGFS_ADD_FILE(monitor_tx_rate, dir_debug, S_IRUSR | S_IWUSR);
++	DEBUGFS_ADD_FILE(bcast_tx_rate, dir_debug, S_IRUSR | S_IWUSR);
+ 
+ 	/* Calibrations disabled/enabled status*/
+ 	DEBUGFS_ADD_FILE(calib_disabled, dir_rf, S_IWUSR | S_IRUSR);
+diff --git a/drivers/net/wireless/iwlwifi/dvm/dev.h b/drivers/net/wireless/iwlwifi/dvm/dev.h
+index 2653a89..420eb1e 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/dev.h
++++ b/drivers/net/wireless/iwlwifi/dvm/dev.h
+@@ -285,7 +285,7 @@ extern const u8 iwl_bcast_addr[ETH_ALEN];
+ /* Sensitivity and chain noise calibration */
+ #define INITIALIZATION_VALUE		0xFFFF
+ #define IWL_CAL_NUM_BEACONS		16
+-#define MAXIMUM_ALLOWED_PATHLOSS	15
++#define MAXIMUM_ALLOWED_PATHLOSS	50
+ 
+ #define CHAIN_NOISE_MAX_DELTA_GAIN_CODE 3
+ 
+@@ -771,6 +771,7 @@ struct iwl_priv {
+ 	u8 agg_tids_count;
+ 
+ 	struct iwl_rx_phy_res last_phy_res;
++	u8 last_cfg_phy_buf[IWLAGN_MAX_CFG_PHY_CNT*sizeof(u32)];
+ 	u32 ampdu_ref;
+ 	bool last_phy_res_valid;
+ 
+@@ -843,6 +844,21 @@ struct iwl_priv {
+ 	void *wowlan_sram;
+ #endif /* CONFIG_IWLWIFI_DEBUGFS */
+ 
++	u32 connector_log;
++	int last_rx_noise;
++	s8 last_rx_noiseA;
++	s8 last_rx_noiseB;
++	s8 last_rx_noiseC;
++	bool bf_enabled;
++	u32 monitor_tx_rate;
++	u32 bcast_tx_rate;
++
++	/* Setup for rotating rates */
++	u32 rotate_rates;
++	u32 last_rotate_rate;
++	u32 rotate_rate_total;
++	u32 *rotate_rate_array;
++
+ 	struct iwl_nvm_data *nvm_data;
+ 	/* eeprom blob for debugfs/testmode */
+ 	u8 *eeprom_blob;
+diff --git a/drivers/net/wireless/iwlwifi/dvm/lib.c b/drivers/net/wireless/iwlwifi/dvm/lib.c
+index 0348f42..73345d0 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/lib.c
++++ b/drivers/net/wireless/iwlwifi/dvm/lib.c
+@@ -40,6 +40,82 @@
+ 
+ #include "dev.h"
+ #include "agn.h"
++#include "connector.h"
++
++int iwlagn_bfee_notif(struct iwl_priv *priv, struct iwl_rx_cmd_buffer *rxb,
++		struct iwl_device_cmd *cmd)
++{
++	/*
++	 * Just print a notification that there was a notification passed up
++	 * from SVD
++	 */
++	struct iwl_rx_packet *pkt = rxb_addr(rxb);
++	struct iwl_bfee_notif *bfee_notif = (void *)pkt->data;
++	u8 Nrx, Ntx;
++	u16 len = le16_to_cpu(bfee_notif->len);
++	struct iwl_rx_phy_res *phy;
++	u32 *non_cfg_buf, *cfg_buf;
++	static u16 bfee_count;
++
++	if (priv->last_phy_res_valid) {
++		phy = &priv->last_phy_res;
++		non_cfg_buf = (u32 *)phy->non_cfg_phy_buf;
++		bfee_notif->timestamp_low =
++			cpu_to_le32(__le64_to_cpu(phy->timestamp));
++		bfee_notif->rssiA =
++			(non_cfg_buf[IWLAGN_RX_RES_RSSI_AB_IDX] &
++			 IWLAGN_OFDM_RSSI_INBAND_A_BITMSK) >>
++			IWLAGN_OFDM_RSSI_A_BIT_POS;
++		bfee_notif->rssiB =
++			(non_cfg_buf[IWLAGN_RX_RES_RSSI_AB_IDX] &
++			 IWLAGN_OFDM_RSSI_INBAND_B_BITMSK) >>
++			IWLAGN_OFDM_RSSI_B_BIT_POS;
++		bfee_notif->rssiC =
++			(non_cfg_buf[IWLAGN_RX_RES_RSSI_C_IDX] &
++			 IWLAGN_OFDM_RSSI_INBAND_C_BITMSK) >>
++			IWLAGN_OFDM_RSSI_C_BIT_POS;
++		bfee_notif->noise = priv->last_rx_noise;
++		bfee_notif->agc =
++			(non_cfg_buf[IWLAGN_RX_RES_AGC_IDX] &
++			 IWLAGN_OFDM_AGC_MSK) >> IWLAGN_OFDM_AGC_BIT_POS;
++		if (phy->cfg_phy_cnt > 0) {
++			cfg_buf = (u32 *)&priv->last_cfg_phy_buf;
++			bfee_notif->antenna_sel = cfg_buf[0];
++		}
++		/* Everything but antennas is in bottom 14 bits */
++		bfee_notif->fake_rate_n_flags =
++			cpu_to_le16(__le32_to_cpu(phy->rate_n_flags) & 0x3fff);
++		IWL_INFO(priv, "rssis: %u %u %u noise: %d agc: %u "
++				"antenna_sel: %02x fake_rate_n_flags=0x%x\n",
++				bfee_notif->rssiA, bfee_notif->rssiB,
++				bfee_notif->rssiC, bfee_notif->noise,
++				bfee_notif->agc, bfee_notif->antenna_sel,
++				bfee_notif->fake_rate_n_flags);
++
++		/* Increment counter */
++		bfee_count++;
++		bfee_notif->bfee_count = cpu_to_le16(bfee_count);
++	}
++
++	/* Log the bytes to a file */
++	if (priv->connector_log & IWL_CONN_BFEE_NOTIF_MSK)
++		connector_send_msg((void *)bfee_notif,
++			len + sizeof(struct iwl_bfee_notif),
++			IWL_CONN_BFEE_NOTIF);
++
++	/* Now print out that we got a notification, and the size of it */
++	Nrx = bfee_notif->Nrx;
++	Ntx = bfee_notif->Ntx;
++	/*
++	 * Each subcarrier uses Ntx * Nrx * 2 * 8 bits for matrix
++	 * (2 signed 8-bit I/Q vals) plus 3 bits for SNR. I think the hardware
++	 * always gives 0 for these 3 bits. See 802.11n spec section 7.3.1.28.
++	 */
++	IWL_DEBUG_RX(priv, "BFEE NOTIFICATION, Nrx=%u Ntx=%u "
++			"len=%u calc_len=%u\n",
++			Nrx, Ntx, len, (30*(3+2*Nrx*Ntx*8)+7)/8);
++	return 0;
++}
+ 
+ int iwlagn_hw_valid_rtc_data_addr(u32 addr)
+ {
+@@ -1262,15 +1338,6 @@ int iwl_dvm_send_cmd(struct iwl_priv *priv, struct iwl_host_cmd *cmd)
+ 	}
+ 
+ 	/*
+-	 * This can happen upon FW ASSERT: we clear the STATUS_FW_ERROR flag
+-	 * in iwl_down but cancel the workers only later.
+-	 */
+-	if (!priv->ucode_loaded) {
+-		IWL_ERR(priv, "Fw not loaded - dropping CMD: %x\n", cmd->id);
+-		return -EIO;
+-	}
+-
+-	/*
+ 	 * Synchronous commands from this op-mode must hold
+ 	 * the mutex, this ensures we don't try to send two
+ 	 * (or more) synchronous commands at a time.
+diff --git a/drivers/net/wireless/iwlwifi/dvm/main.c b/drivers/net/wireless/iwlwifi/dvm/main.c
+index faa0593..882f025 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/main.c
++++ b/drivers/net/wireless/iwlwifi/dvm/main.c
+@@ -56,6 +56,7 @@
+ #include "dev.h"
+ #include "calib.h"
+ #include "agn.h"
++#include "connector.h"
+ 
+ 
+ /******************************************************************************
+@@ -567,7 +568,7 @@ static void iwl_init_context(struct iwl_priv *priv, u32 ucode_flags)
+ 	priv->contexts[IWL_RXON_CTX_BSS].exclusive_interface_modes =
+ 		BIT(NL80211_IFTYPE_ADHOC) | BIT(NL80211_IFTYPE_MONITOR);
+ 	priv->contexts[IWL_RXON_CTX_BSS].interface_modes =
+-		BIT(NL80211_IFTYPE_STATION);
++		BIT(NL80211_IFTYPE_STATION) | BIT(NL80211_IFTYPE_AP);
+ 	priv->contexts[IWL_RXON_CTX_BSS].ap_devtype = RXON_DEV_TYPE_AP;
+ 	priv->contexts[IWL_RXON_CTX_BSS].ibss_devtype = RXON_DEV_TYPE_IBSS;
+ 	priv->contexts[IWL_RXON_CTX_BSS].station_devtype = RXON_DEV_TYPE_ESS;
+@@ -808,6 +809,8 @@ int iwl_alive_start(struct iwl_priv *priv)
+ 	/* At this point, the NIC is initialized and operational */
+ 	iwl_rf_kill_ct_config(priv);
+ 
++	iwl_connector_set_priv(priv);
++
+ 	IWL_DEBUG_INFO(priv, "ALIVE processing complete.\n");
+ 
+ 	return iwl_power_update_mode(priv, true);
+@@ -1109,6 +1112,16 @@ static int iwl_init_drv(struct iwl_priv *priv)
+ 	priv->missed_beacon_threshold = IWL_MISSED_BEACON_THRESHOLD_DEF;
+ 	priv->agg_tids_count = 0;
+ 
++	/* Dan's parameters */
++	priv->connector_log = iwlwifi_mod_params.connector_log;
++	priv->bf_enabled = 1;		/* Enabled */
++	priv->rotate_rates = 0;		/* Disabled */
++	priv->last_rotate_rate = 0;	/* Disabled */
++	priv->rotate_rate_total = 0;	/* Disabled */
++	priv->rotate_rate_array = NULL;	/* Disabled */
++	priv->monitor_tx_rate = 0;	/* Disabled */
++	priv->bcast_tx_rate = 0;	/* Disabled */
++
+ 	priv->ucode_owner = IWL_OWNERSHIP_DRIVER;
+ 
+ 	priv->rx_statistics_jiffies = jiffies;
+@@ -1244,6 +1257,7 @@ static struct iwl_op_mode *iwl_op_mode_dvm_start(struct iwl_trans *trans,
+ 		REPLY_COMPRESSED_BA,
+ 		STATISTICS_NOTIFICATION,
+ 		REPLY_TX,
++		REPLY_BFEE_NOTIFICATION,
+ 	};
+ 	int i;
+ 
+@@ -2157,19 +2171,33 @@ static int __init iwl_init(void)
+ 		return ret;
+ 	}
+ 
++	ret = iwlagn_register_connector();
++	if (ret) {
++		pr_err("Unable to initialize connector: %d\n", ret);
++		goto error_connector_register;
++	}
++
+ 	ret = iwl_opmode_register("iwldvm", &iwl_dvm_ops);
+ 	if (ret) {
+ 		pr_err("Unable to register op_mode: %d\n", ret);
+-		iwlagn_rate_control_unregister();
++		goto error_opmode_register;
+ 	}
+ 
+ 	return ret;
++
++error_opmode_register:
++	iwlagn_unregister_connector();
++error_connector_register:
++	iwlagn_rate_control_unregister();
++
++	return ret;
+ }
+ module_init(iwl_init);
+ 
+ static void __exit iwl_exit(void)
+ {
+ 	iwl_opmode_deregister("iwldvm");
++	iwlagn_unregister_connector();
+ 	iwlagn_rate_control_unregister();
+ }
+ module_exit(iwl_exit);
+diff --git a/drivers/net/wireless/iwlwifi/dvm/rs.c b/drivers/net/wireless/iwlwifi/dvm/rs.c
+index f3dd0da..1e01c91 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/rs.c
++++ b/drivers/net/wireless/iwlwifi/dvm/rs.c
+@@ -930,6 +930,10 @@ static void rs_tx_status(void *priv_r, struct ieee80211_supported_band *sband,
+ 		return;
+ 	}
+ 
++	/* Exit if in a fixed-rate mode */
++	if (priv && priv->rotate_rates)
++		return;
++
+ 	if (!ieee80211_is_data(hdr->frame_control) ||
+ 	    info->flags & IEEE80211_TX_CTL_NO_ACK)
+ 		return;
+@@ -2767,6 +2771,13 @@ static void rs_get_rate(void *priv_r, struct ieee80211_sta *sta, void *priv_sta,
+ 	if (rate_control_send_low(sta, priv_sta, txrc))
+ 		return;
+ 
++	/* Exit if in a fixed-rate mode */
++	if (priv && priv->rotate_rates) {
++		info->control.rates[0].flags = 0;
++		info->control.rates[0].idx = 0;
++		return;
++	}
++
+ 	rate_idx  = lq_sta->last_txrate_idx;
+ 
+ 	if (lq_sta->last_rate_n_flags & RATE_MCS_HT_MSK) {
+diff --git a/drivers/net/wireless/iwlwifi/dvm/rx.c b/drivers/net/wireless/iwlwifi/dvm/rx.c
+index cac4f37..140c8f8 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/rx.c
++++ b/drivers/net/wireless/iwlwifi/dvm/rx.c
+@@ -36,6 +36,7 @@
+ #include "dev.h"
+ #include "calib.h"
+ #include "agn.h"
++#include "connector.h"
+ 
+ #define IWL_CMD_ENTRY(x) [x] = #x
+ 
+@@ -114,6 +115,7 @@ const char *iwl_dvm_cmd_strings[REPLY_MAX] = {
+ 	IWL_CMD_ENTRY(REPLY_WOWLAN_KEK_KCK_MATERIAL),
+ 	IWL_CMD_ENTRY(REPLY_WOWLAN_GET_STATUS),
+ 	IWL_CMD_ENTRY(REPLY_D3_CONFIG),
++	IWL_CMD_ENTRY(REPLY_BFEE_NOTIFICATION),
+ };
+ #undef IWL_CMD_ENTRY
+ 
+@@ -374,10 +376,17 @@ static void iwlagn_rx_calc_noise(struct iwl_priv *priv)
+ 	}
+ 
+ 	/* Average among active antennas */
+-	if (num_active_rx)
++	if (num_active_rx) {
+ 		last_rx_noise = (total_silence / num_active_rx) - 107;
+-	else
++		if (priv->connector_log & IWL_CONN_NOISE_MSK)
++			connector_send_msg((void *)&last_rx_noise,
++					sizeof(last_rx_noise), IWL_CONN_NOISE);
++	} else
+ 		last_rx_noise = IWL_NOISE_MEAS_NOT_AVAILABLE;
++	priv->last_rx_noise = last_rx_noise;
++	priv->last_rx_noiseA = bcn_silence_a;
++	priv->last_rx_noiseB = bcn_silence_b;
++	priv->last_rx_noiseC = bcn_silence_c;
+ 
+ 	IWL_DEBUG_CALIB(priv, "inband silence a %u, b %u, c %u, dBm %d\n",
+ 			bcn_silence_a, bcn_silence_b, bcn_silence_c,
+@@ -663,11 +672,14 @@ static int iwlagn_rx_reply_rx_phy(struct iwl_priv *priv,
+ 				struct iwl_device_cmd *cmd)
+ {
+ 	struct iwl_rx_packet *pkt = rxb_addr(rxb);
++	struct iwl_rx_phy_res *rx_phy_res = (void *)pkt->data;
+ 
+ 	priv->last_phy_res_valid = true;
+ 	priv->ampdu_ref++;
+ 	memcpy(&priv->last_phy_res, pkt->data,
+ 	       sizeof(struct iwl_rx_phy_res));
++	memcpy(&priv->last_cfg_phy_buf, rx_phy_res->cfg_phy_buf,
++			rx_phy_res->cfg_phy_cnt * sizeof(u32));
+ 	return 0;
+ }
+ 
+@@ -919,10 +931,12 @@ static int iwlagn_rx_reply_rx(struct iwl_priv *priv,
+ 	rx_pkt_status = *(__le32 *)(pkt->data + sizeof(*amsdu) + len);
+ 	ampdu_status = iwlagn_translate_rx_status(priv,
+ 						  le32_to_cpu(rx_pkt_status));
++	if (priv->connector_log & IWL_CONN_RX_MPDU_MSK)
++		connector_send_msg((void *)header, len, IWL_CONN_RX_MPDU);
+ 
+-	if ((unlikely(phy_res->cfg_phy_cnt > 20))) {
+-		IWL_DEBUG_DROP(priv, "dsp size out of range [0,20]: %d\n",
+-				phy_res->cfg_phy_cnt);
++	if ((unlikely(phy_res->cfg_phy_cnt > IWLAGN_MAX_CFG_PHY_CNT))) {
++		IWL_DEBUG_DROP(priv, "dsp size out of range [0,%d]: %d\n",
++				IWLAGN_MAX_CFG_PHY_CNT, phy_res->cfg_phy_cnt);
+ 		return 0;
+ 	}
+ 
+@@ -1096,6 +1110,9 @@ void iwl_setup_rx_handlers(struct iwl_priv *priv)
+ 	handlers[REPLY_COMPRESSED_BA]		=
+ 		iwlagn_rx_reply_compressed_ba;
+ 
++	/* Beamforming */
++	handlers[REPLY_BFEE_NOTIFICATION] = iwlagn_bfee_notif;
++
+ 	priv->rx_handlers[REPLY_TX] = iwlagn_rx_reply_tx;
+ 
+ 	/* set up notification wait support */
+diff --git a/drivers/net/wireless/iwlwifi/dvm/rxon.c b/drivers/net/wireless/iwlwifi/dvm/rxon.c
+index 9a891e6..f9f2599 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/rxon.c
++++ b/drivers/net/wireless/iwlwifi/dvm/rxon.c
+@@ -529,6 +529,33 @@ static int iwlagn_rxon_connect(struct iwl_priv *priv,
+ 	return 0;
+ }
+ 
++int iwlagn_send_dsp_debug(struct iwl_priv *priv)
++{
++	u32 count = 1;
++	size_t len = sizeof(struct iwl5000_dsp_debug) +
++		((count + 1) & ~1) * sizeof(u16);
++	struct iwl5000_dsp_debug *dsp_debug = kmalloc(len, GFP_ATOMIC);
++	u16 *mib_indices;
++	int ret;
++
++	if (!dsp_debug)
++		return -ENOMEM;
++
++	mib_indices = (u16 *) dsp_debug->mib_indices;
++
++	dsp_debug->mib_cnt = count;
++	dsp_debug->flags = DSP_DEBUG_OFDM_MSK;
++	dsp_debug->stat_id = 0;
++	dsp_debug->reserved = 0;
++	mib_indices[0] = OFDM_RX_ANT_OUT;
++
++	ret = iwl_dvm_send_cmd_pdu(priv, DSP_DEBUG_CMD, CMD_ASYNC, len,
++			dsp_debug);
++	kfree(dsp_debug);
++
++	return ret;
++}
++
+ int iwlagn_set_pan_params(struct iwl_priv *priv)
+ {
+ 	struct iwl_wipan_params_cmd cmd;
+@@ -1065,6 +1092,12 @@ int iwlagn_commit_rxon(struct iwl_priv *priv, struct iwl_rxon_context *ctx)
+ 	if (!ctx->is_active)
+ 		return 0;
+ 
++	/* Enable beamforming */
++	if (priv->bf_enabled)
++		ctx->staging.flags |= RXON_FLG_BF_ENABLE_MSK;
++	else
++		ctx->staging.flags &= ~RXON_FLG_BF_ENABLE_MSK;
++
+ 	/* always get timestamp with Rx frame */
+ 	ctx->staging.flags |= RXON_FLG_TSF2HOST_MSK;
+ 
+@@ -1148,6 +1181,11 @@ int iwlagn_commit_rxon(struct iwl_priv *priv, struct iwl_rxon_context *ctx)
+ 	if (ret)
+ 		return ret;
+ 
++	/* DSP debug command makes sure we get antenna selection information */
++	ret = iwlagn_send_dsp_debug(priv);
++	if (ret)
++		return ret;
++
+ 	ret = iwlagn_set_pan_params(priv);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/net/wireless/iwlwifi/dvm/sta.c b/drivers/net/wireless/iwlwifi/dvm/sta.c
+index bdba954..80dfb3a 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/sta.c
++++ b/drivers/net/wireless/iwlwifi/dvm/sta.c
+@@ -33,6 +33,7 @@
+ #include "agn.h"
+ 
+ const u8 iwl_bcast_addr[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
++const u8 iwl_monitor_addr[ETH_ALEN] = { 0x00, 0x16, 0xEA, 0x12, 0x34, 0x56 };
+ 
+ static int iwl_sta_ucode_activate(struct iwl_priv *priv, u8 sta_id)
+ {
+@@ -305,6 +306,8 @@ u8 iwl_prep_station(struct iwl_priv *priv, struct iwl_rxon_context *ctx,
+ 		sta_id = ctx->ap_sta_id;
+ 	else if (is_broadcast_ether_addr(addr))
+ 		sta_id = ctx->bcast_sta_id;
++	else if (is_monitor_ether_addr(addr))
++		sta_id = IWLAGN_MONITOR_ID;
+ 	else
+ 		for (i = IWL_STA_ID; i < IWLAGN_STATION_COUNT; i++) {
+ 			if (ether_addr_equal(priv->stations[i].sta.sta.addr,
+@@ -1354,6 +1357,31 @@ int iwlagn_alloc_bcast_station(struct iwl_priv *priv,
+ 	priv->stations[sta_id].lq = link_cmd;
+ 	spin_unlock_bh(&priv->sta_lock);
+ 
++	/* Above: broadcast. Below: monitor */
++	spin_lock_bh(&priv->sta_lock);
++	sta_id = iwl_prep_station(priv, ctx, iwl_monitor_addr, false, NULL);
++	if (sta_id == IWL_INVALID_STATION) {
++		IWL_ERR(priv, "Unable to prepare monitor station\n");
++		spin_unlock_bh(&priv->sta_lock);
++
++		return -EINVAL;
++	}
++
++	priv->stations[sta_id].used |= IWL_STA_DRIVER_ACTIVE;
++	priv->stations[sta_id].used |= IWL_STA_BCAST;
++	spin_unlock_bh(&priv->sta_lock);
++
++	link_cmd = iwl_sta_alloc_lq(priv, ctx, sta_id);
++	if (!link_cmd) {
++		IWL_ERR(priv,
++			"Unable to initialize rate scaling for monitor station.\n");
++		return -ENOMEM;
++	}
++
++	spin_lock_bh(&priv->sta_lock);
++	priv->stations[sta_id].lq = link_cmd;
++	spin_unlock_bh(&priv->sta_lock);
++
+ 	return 0;
+ }
+ 
+@@ -1383,6 +1411,23 @@ int iwl_update_bcast_station(struct iwl_priv *priv,
+ 	priv->stations[sta_id].lq = link_cmd;
+ 	spin_unlock_bh(&priv->sta_lock);
+ 
++	/* Above: broadcast. Below: monitor */
++	sta_id = IWLAGN_MONITOR_ID;
++
++	link_cmd = iwl_sta_alloc_lq(priv, ctx, sta_id);
++	if (!link_cmd) {
++		IWL_ERR(priv, "Unable to initialize rate scaling for monitor station.\n");
++		return -ENOMEM;
++	}
++
++	spin_lock_bh(&priv->sta_lock);
++	if (priv->stations[sta_id].lq)
++		kfree(priv->stations[sta_id].lq);
++	else
++		IWL_DEBUG_INFO(priv, "Monitor station rate scaling has not been initialized yet.\n");
++	priv->stations[sta_id].lq = link_cmd;
++	spin_unlock_bh(&priv->sta_lock);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/wireless/iwlwifi/dvm/tx.c b/drivers/net/wireless/iwlwifi/dvm/tx.c
+index 2797964..3ab4d49 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/tx.c
++++ b/drivers/net/wireless/iwlwifi/dvm/tx.c
+@@ -157,9 +157,23 @@ static void iwlagn_tx_cmd_build_rate(struct iwl_priv *priv,
+ 	tx_cmd->data_retry_limit = data_retry_limit;
+ 	tx_cmd->rts_retry_limit = rts_retry_limit;
+ 
+-	/* DATA packets will use the uCode station table for rate/antenna
+-	 * selection */
+-	if (ieee80211_is_data(fc)) {
++	/*
++	 * DATA packets will use the uCode station table for rate/antenna
++	 * selection.
++	 * ...
++	 * But handle some special experimental cases first
++	 */
++	if (ieee80211_is_data(fc) && priv->rotate_rates) {
++		tx_cmd->tx_flags &= ~TX_CMD_FLG_STA_RATE_MSK;
++		tx_cmd->rate_n_flags = cpu_to_le32(
++			priv->rotate_rate_array[priv->last_rotate_rate]);
++		priv->last_rotate_rate = (priv->last_rotate_rate + 1) %
++			priv->rotate_rate_total;
++		/* No retries in this mode */
++		tx_cmd->data_retry_limit = 0;
++		tx_cmd->rts_retry_limit = 0;
++		return;
++	} else if (ieee80211_is_data(fc)) {
+ 		tx_cmd->initial_rate_index = 0;
+ 		tx_cmd->tx_flags |= TX_CMD_FLG_STA_RATE_MSK;
+ #ifdef CONFIG_IWLWIFI_DEVICE_TESTMODE
+@@ -354,6 +368,8 @@ int iwlagn_tx_skb(struct iwl_priv *priv,
+ 			goto drop_unlock_priv;
+ 		}
+ 	}
++	if (sta == NULL && is_monitor_ether_addr(hdr->addr1))
++		sta_id = IWLAGN_MONITOR_ID;
+ 
+ 	IWL_DEBUG_TX(priv, "station Id %d\n", sta_id);
+ 
+@@ -396,7 +412,19 @@ int iwlagn_tx_skb(struct iwl_priv *priv,
+ 	/* TODO need this for burst mode later on */
+ 	iwlagn_tx_cmd_build_basic(priv, skb, tx_cmd, info, hdr, sta_id);
+ 
+-	iwlagn_tx_cmd_build_rate(priv, tx_cmd, info, sta, fc);
++	/* If packet is to the monitor address, use the monitor rate; or
++	 * if packet is to the broadcast address, use the broadcast rate
++	 */
++	if ((IWLAGN_MONITOR_ID == sta_id) &&
++			(priv->monitor_tx_rate != 0)) {
++		tx_cmd->tx_flags &= ~TX_CMD_FLG_STA_RATE_MSK;
++		tx_cmd->rate_n_flags = cpu_to_le32(priv->monitor_tx_rate);
++	} else if ((ctx->bcast_sta_id == sta_id) &&
++			(priv->bcast_tx_rate != 0)) {
++		tx_cmd->tx_flags &= ~TX_CMD_FLG_STA_RATE_MSK;
++		tx_cmd->rate_n_flags = cpu_to_le32(priv->bcast_tx_rate);
++	} else
++		iwlagn_tx_cmd_build_rate(priv, tx_cmd, info, sta, fc);
+ 
+ 	memset(&info->status, 0, sizeof(info->status));
+ 
+diff --git a/drivers/net/wireless/iwlwifi/dvm/ucode.c b/drivers/net/wireless/iwlwifi/dvm/ucode.c
+index 9b138b8..c6467e5 100644
+--- a/drivers/net/wireless/iwlwifi/dvm/ucode.c
++++ b/drivers/net/wireless/iwlwifi/dvm/ucode.c
+@@ -450,8 +450,6 @@ int iwl_load_ucode_wait_alive(struct iwl_priv *priv,
+ 		return -EIO;
+ 	}
+ 
+-	priv->ucode_loaded = true;
+-
+ 	/*
+ 	 * This step takes a long time (60-80ms!!) and
+ 	 * WoWLAN image should be loaded quickly, so
+@@ -476,6 +474,8 @@ int iwl_load_ucode_wait_alive(struct iwl_priv *priv,
+ 		return ret;
+ 	}
+ 
++	priv->ucode_loaded = true;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/wireless/iwlwifi/iwl-devtrace.h b/drivers/net/wireless/iwlwifi/iwl-devtrace.h
+index c85eb37..dc7e26b 100644
+--- a/drivers/net/wireless/iwlwifi/iwl-devtrace.h
++++ b/drivers/net/wireless/iwlwifi/iwl-devtrace.h
+@@ -349,23 +349,25 @@ TRACE_EVENT(iwlwifi_dev_rx_data,
+ TRACE_EVENT(iwlwifi_dev_hcmd,
+ 	TP_PROTO(const struct device *dev,
+ 		 struct iwl_host_cmd *cmd, u16 total_size,
+-		 struct iwl_cmd_header *hdr),
+-	TP_ARGS(dev, cmd, total_size, hdr),
++		 const void *hdr, size_t hdr_len),
++	TP_ARGS(dev, cmd, total_size, hdr, hdr_len),
+ 	TP_STRUCT__entry(
+ 		DEV_ENTRY
+ 		__dynamic_array(u8, hcmd, total_size)
+ 		__field(u32, flags)
+ 	),
+ 	TP_fast_assign(
+-		int i, offset = sizeof(*hdr);
++		int i, offset = hdr_len;
+ 
+ 		DEV_ASSIGN;
+ 		__entry->flags = cmd->flags;
+-		memcpy(__get_dynamic_array(hcmd), hdr, sizeof(*hdr));
++		memcpy(__get_dynamic_array(hcmd), hdr, hdr_len);
+ 
+ 		for (i = 0; i < IWL_MAX_CMD_TFDS; i++) {
+ 			if (!cmd->len[i])
+ 				continue;
++			if (!(cmd->dataflags[i] & IWL_HCMD_DFL_NOCOPY))
++				continue;
+ 			memcpy((u8 *)__get_dynamic_array(hcmd) + offset,
+ 			       cmd->data[i], cmd->len[i]);
+ 			offset += cmd->len[i];
+diff --git a/drivers/net/wireless/iwlwifi/iwl-drv.c b/drivers/net/wireless/iwlwifi/iwl-drv.c
+index d3549f4..53e2244 100644
+--- a/drivers/net/wireless/iwlwifi/iwl-drv.c
++++ b/drivers/net/wireless/iwlwifi/iwl-drv.c
+@@ -878,6 +878,12 @@ static void iwl_req_fw_callback(const struct firmware *ucode_raw, void *context)
+ 	api_ver = IWL_UCODE_API(drv->fw.ucode_ver);
+ 
+ 	/*
++	 * Dan -- disable firmware version checks. Instead, verify
++	 * that the firmware has the size expected for the hacked firmware
++	 */
++	(void)api_min; /* Dan -- remove warning */
++#if 0
++	/*
+ 	 * api_ver should match the api version forming part of the
+ 	 * firmware filename ... but we don't check for that and only rely
+ 	 * on the API version read from firmware header from here on forward
+@@ -905,6 +911,12 @@ static void iwl_req_fw_callback(const struct firmware *ucode_raw, void *context)
+ 				      "http://www.intellinuxwireless.org/.\n");
+ 		}
+ 	}
++#endif
++
++	if (ucode_raw->size != 336252) {
++		IWL_ERR(drv,
++			"Firmware size does not match iwlwifi-5000-2.ucode.sigcomm2010. The UW 802.11n CSI Tool will not work.\n");
++	}
+ 
+ 	IWL_INFO(drv, "loaded firmware version %s", drv->fw.fw_version);
+ 
+@@ -1098,6 +1110,7 @@ struct iwl_mod_params iwlwifi_mod_params = {
+ 	.plcp_check = true,
+ 	.bt_coex_active = true,
+ 	.power_level = IWL_POWER_INDEX_1,
++	.debug_level = IWL_DL_FW_ERRORS,
+ 	.bt_ch_announce = true,
+ 	.auto_agg = true,
+ 	.wd_disable = true,
+@@ -1191,6 +1204,10 @@ module_param_named(debug, iwlwifi_mod_params.debug_level, uint,
+ MODULE_PARM_DESC(debug, "debug output mask");
+ #endif
+ 
++module_param_named(connector_log, iwlwifi_mod_params.connector_log, int,
++		S_IRUGO);
++MODULE_PARM_DESC(connector_log,
++		"set connector log mask (default 0 [nothing])");
+ module_param_named(swcrypto, iwlwifi_mod_params.sw_crypto, int, S_IRUGO);
+ MODULE_PARM_DESC(swcrypto, "using crypto in software (default 0 [hardware])");
+ module_param_named(11n_disable, iwlwifi_mod_params.disable_11n, uint, S_IRUGO);
+diff --git a/drivers/net/wireless/iwlwifi/iwl-modparams.h b/drivers/net/wireless/iwlwifi/iwl-modparams.h
+index d9a86d6..810cdd0 100644
+--- a/drivers/net/wireless/iwlwifi/iwl-modparams.h
++++ b/drivers/net/wireless/iwlwifi/iwl-modparams.h
+@@ -92,6 +92,7 @@ enum iwl_power_level {
+  * @disable_11n: disable 11n capabilities, default = 0,
+  *	use IWL_DISABLE_HT_* constants
+  * @amsdu_size_8K: enable 8K amsdu size, default = 1
++ * @connector_log: which connector messages, default = 0
+  * @restart_fw: restart firmware, default = 1
+  * @plcp_check: enable plcp health check, default = true
+  * @wd_disable: enable stuck queue check, default = 0
+@@ -99,7 +100,7 @@ enum iwl_power_level {
+  * @led_mode: system default, default = 0
+  * @power_save: disable power save, default = false
+  * @power_level: power level, default = 1
+- * @debug_level: levels are IWL_DL_*
++ * @debug_level: levels are IWL_DL_*, default = IWL_DL_FW_ERRORS
+  * @ant_coupling: antenna coupling in dB, default = 0
+  * @bt_ch_announce: BT channel inhibition, default = enable
+  * @auto_agg: enable agg. without check, default = true
+@@ -110,6 +111,7 @@ struct iwl_mod_params {
+ 	unsigned int disable_11n;
+ 	int amsdu_size_8K;
+ 	int restart_fw;
++	int connector_log;
+ 	bool plcp_check;
+ 	int  wd_disable;
+ 	bool bt_coex_active;
+diff --git a/drivers/net/wireless/iwlwifi/iwl-trans.h b/drivers/net/wireless/iwlwifi/iwl-trans.h
+index b76532e..35f629d 100644
+--- a/drivers/net/wireless/iwlwifi/iwl-trans.h
++++ b/drivers/net/wireless/iwlwifi/iwl-trans.h
+@@ -294,7 +294,7 @@ static inline struct page *rxb_steal_page(struct iwl_rx_cmd_buffer *r)
+ 	return r->_page;
+ }
+ 
+-#define MAX_NO_RECLAIM_CMDS	6
++#define MAX_NO_RECLAIM_CMDS	7
+ 
+ #define IWL_MASK(lo, hi) ((1 << (hi)) | ((1 << (hi)) - (1 << (lo))))
+ 
+diff --git a/drivers/net/wireless/iwlwifi/pcie/5000.c b/drivers/net/wireless/iwlwifi/pcie/5000.c
+index 83ca403..ea218f3 100644
+--- a/drivers/net/wireless/iwlwifi/pcie/5000.c
++++ b/drivers/net/wireless/iwlwifi/pcie/5000.c
+@@ -36,7 +36,7 @@
+ #define IWL5150_UCODE_API_MAX 2
+ 
+ /* Oldest version we won't warn about */
+-#define IWL5000_UCODE_API_OK 5
++#define IWL5000_UCODE_API_OK 2
+ #define IWL5150_UCODE_API_OK 2
+ 
+ /* Lowest firmware API version supported */
+diff --git a/drivers/net/wireless/iwlwifi/pcie/internal.h b/drivers/net/wireless/iwlwifi/pcie/internal.h
+index bc5e9ec..d91d2e8 100644
+--- a/drivers/net/wireless/iwlwifi/pcie/internal.h
++++ b/drivers/net/wireless/iwlwifi/pcie/internal.h
+@@ -182,15 +182,6 @@ struct iwl_queue {
+ #define TFD_TX_CMD_SLOTS 256
+ #define TFD_CMD_SLOTS 32
+ 
+-/*
+- * The FH will write back to the first TB only, so we need
+- * to copy some data into the buffer regardless of whether
+- * it should be mapped or not. This indicates how much to
+- * copy, even for HCMDs it must be big enough to fit the
+- * DRAM scratch from the TX cmd, at least 16 bytes.
+- */
+-#define IWL_HCMD_MIN_COPY_SIZE	16
+-
+ struct iwl_pcie_txq_entry {
+ 	struct iwl_device_cmd *cmd;
+ 	struct iwl_device_cmd *copy_cmd;
+diff --git a/drivers/net/wireless/iwlwifi/pcie/tx.c b/drivers/net/wireless/iwlwifi/pcie/tx.c
+index d760da9..6c5b867 100644
+--- a/drivers/net/wireless/iwlwifi/pcie/tx.c
++++ b/drivers/net/wireless/iwlwifi/pcie/tx.c
+@@ -1131,12 +1131,10 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 	void *dup_buf = NULL;
+ 	dma_addr_t phys_addr;
+ 	int idx;
+-	u16 copy_size, cmd_size, dma_size;
++	u16 copy_size, cmd_size;
+ 	bool had_nocopy = false;
+ 	int i;
+ 	u32 cmd_pos;
+-	const u8 *cmddata[IWL_MAX_CMD_TFDS];
+-	u16 cmdlen[IWL_MAX_CMD_TFDS];
+ 
+ 	copy_size = sizeof(out_cmd->hdr);
+ 	cmd_size = sizeof(out_cmd->hdr);
+@@ -1145,23 +1143,8 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 	BUILD_BUG_ON(IWL_MAX_CMD_TFDS > IWL_NUM_OF_TBS - 1);
+ 
+ 	for (i = 0; i < IWL_MAX_CMD_TFDS; i++) {
+-		cmddata[i] = cmd->data[i];
+-		cmdlen[i] = cmd->len[i];
+-
+ 		if (!cmd->len[i])
+ 			continue;
+-
+-		/* need at least IWL_HCMD_MIN_COPY_SIZE copied */
+-		if (copy_size < IWL_HCMD_MIN_COPY_SIZE) {
+-			int copy = IWL_HCMD_MIN_COPY_SIZE - copy_size;
+-
+-			if (copy > cmdlen[i])
+-				copy = cmdlen[i];
+-			cmdlen[i] -= copy;
+-			cmddata[i] += copy;
+-			copy_size += copy;
+-		}
+-
+ 		if (cmd->dataflags[i] & IWL_HCMD_DFL_NOCOPY) {
+ 			had_nocopy = true;
+ 			if (WARN_ON(cmd->dataflags[i] & IWL_HCMD_DFL_DUP)) {
+@@ -1181,7 +1164,7 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 				goto free_dup_buf;
+ 			}
+ 
+-			dup_buf = kmemdup(cmddata[i], cmdlen[i],
++			dup_buf = kmemdup(cmd->data[i], cmd->len[i],
+ 					  GFP_ATOMIC);
+ 			if (!dup_buf)
+ 				return -ENOMEM;
+@@ -1191,7 +1174,7 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 				idx = -EINVAL;
+ 				goto free_dup_buf;
+ 			}
+-			copy_size += cmdlen[i];
++			copy_size += cmd->len[i];
+ 		}
+ 		cmd_size += cmd->len[i];
+ 	}
+@@ -1238,31 +1221,14 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 
+ 	/* and copy the data that needs to be copied */
+ 	cmd_pos = offsetof(struct iwl_device_cmd, payload);
+-	copy_size = sizeof(out_cmd->hdr);
+ 	for (i = 0; i < IWL_MAX_CMD_TFDS; i++) {
+-		int copy = 0;
+-
+ 		if (!cmd->len[i])
+ 			continue;
+-
+-		/* need at least IWL_HCMD_MIN_COPY_SIZE copied */
+-		if (copy_size < IWL_HCMD_MIN_COPY_SIZE) {
+-			copy = IWL_HCMD_MIN_COPY_SIZE - copy_size;
+-
+-			if (copy > cmd->len[i])
+-				copy = cmd->len[i];
+-		}
+-
+-		/* copy everything if not nocopy/dup */
+-		if (!(cmd->dataflags[i] & (IWL_HCMD_DFL_NOCOPY |
+-					   IWL_HCMD_DFL_DUP)))
+-			copy = cmd->len[i];
+-
+-		if (copy) {
+-			memcpy((u8 *)out_cmd + cmd_pos, cmd->data[i], copy);
+-			cmd_pos += copy;
+-			copy_size += copy;
+-		}
++		if (cmd->dataflags[i] & (IWL_HCMD_DFL_NOCOPY |
++					 IWL_HCMD_DFL_DUP))
++			break;
++		memcpy((u8 *)out_cmd + cmd_pos, cmd->data[i], cmd->len[i]);
++		cmd_pos += cmd->len[i];
+ 	}
+ 
+ 	WARN_ON_ONCE(txq->entries[idx].copy_cmd);
+@@ -1288,14 +1254,7 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 		     out_cmd->hdr.cmd, le16_to_cpu(out_cmd->hdr.sequence),
+ 		     cmd_size, q->write_ptr, idx, trans_pcie->cmd_queue);
+ 
+-	/*
+-	 * If the entire command is smaller than IWL_HCMD_MIN_COPY_SIZE, we must
+-	 * still map at least that many bytes for the hardware to write back to.
+-	 * We have enough space, so that's not a problem.
+-	 */
+-	dma_size = max_t(u16, copy_size, IWL_HCMD_MIN_COPY_SIZE);
+-
+-	phys_addr = dma_map_single(trans->dev, &out_cmd->hdr, dma_size,
++	phys_addr = dma_map_single(trans->dev, &out_cmd->hdr, copy_size,
+ 				   DMA_BIDIRECTIONAL);
+ 	if (unlikely(dma_mapping_error(trans->dev, phys_addr))) {
+ 		idx = -ENOMEM;
+@@ -1303,15 +1262,14 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 	}
+ 
+ 	dma_unmap_addr_set(out_meta, mapping, phys_addr);
+-	dma_unmap_len_set(out_meta, len, dma_size);
++	dma_unmap_len_set(out_meta, len, copy_size);
+ 
+ 	iwl_pcie_txq_build_tfd(trans, txq, phys_addr, copy_size, 1);
+ 
+-	/* map the remaining (adjusted) nocopy/dup fragments */
+ 	for (i = 0; i < IWL_MAX_CMD_TFDS; i++) {
+-		const void *data = cmddata[i];
++		const void *data = cmd->data[i];
+ 
+-		if (!cmdlen[i])
++		if (!cmd->len[i])
+ 			continue;
+ 		if (!(cmd->dataflags[i] & (IWL_HCMD_DFL_NOCOPY |
+ 					   IWL_HCMD_DFL_DUP)))
+@@ -1319,7 +1277,7 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 		if (cmd->dataflags[i] & IWL_HCMD_DFL_DUP)
+ 			data = dup_buf;
+ 		phys_addr = dma_map_single(trans->dev, (void *)data,
+-					   cmdlen[i], DMA_BIDIRECTIONAL);
++					   cmd->len[i], DMA_BIDIRECTIONAL);
+ 		if (dma_mapping_error(trans->dev, phys_addr)) {
+ 			iwl_pcie_tfd_unmap(trans, out_meta,
+ 					   &txq->tfds[q->write_ptr],
+@@ -1328,7 +1286,7 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 			goto out;
+ 		}
+ 
+-		iwl_pcie_txq_build_tfd(trans, txq, phys_addr, cmdlen[i], 0);
++		iwl_pcie_txq_build_tfd(trans, txq, phys_addr, cmd->len[i], 0);
+ 	}
+ 
+ 	out_meta->flags = cmd->flags;
+@@ -1338,7 +1296,8 @@ static int iwl_pcie_enqueue_hcmd(struct iwl_trans *trans,
+ 
+ 	txq->need_update = 1;
+ 
+-	trace_iwlwifi_dev_hcmd(trans->dev, cmd, cmd_size, &out_cmd->hdr);
++	trace_iwlwifi_dev_hcmd(trans->dev, cmd, cmd_size,
++			       &out_cmd->hdr, copy_size);
+ 
+ 	/* start timer if queue currently empty */
+ 	if (q->read_ptr == q->write_ptr && trans_pcie->wd_timeout)
+-- 
+2.1.4
+
